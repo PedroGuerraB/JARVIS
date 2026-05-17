@@ -1,91 +1,35 @@
-import { asInsert } from '@jarvis/db';
-import type { AgentTask, AgentResult } from '@jarvis/shared';
-import { BaseAgent, type ToolHandler } from '../base/BaseAgent.js';
-import { organicMiningTool, metaAdLibraryTool } from '@jarvis/tools';
+import type { AgentTask, AgentResult, ToolHandler } from '@jarvis/shared';
+import { BaseAgent } from '../base/BaseAgent.js';
+import { getMcpServers } from '../mcp-config.js';
+import { organicMiningTool } from '@jarvis/tools';
 
 const SYSTEM_PROMPT = `Você é o Scout Agent do JARVIS.
 Sua missão: mineração de anúncios e criativos do mercado de alfabetização.
 
-Responsabilidades:
-- Minerar anúncios no Meta Ad Library e conteúdo orgânico
-- Identificar padrões virais em copies e hooks
-- Classificar ads por score de viralidade
-- Persistir intel na base de dados para outros agentes consumirem
-- Aprender com histórico: evitar re-minerar o que já está catalogado
+Ferramentas disponíveis:
+- **meta_ads MCP**: Use para buscar anúncios no Meta Ad Library. Prefira meta_ads__search_ads ou similar.
+- **supabase MCP**: Use para persistir dados. Tabelas relevantes: ad_library, hooks_library.
+- **mine_organic_offers**: Ferramenta custom para mineração no orgânico.
 
-Foco de nicho: alfabetização infantil, método fônico, leitura para crianças.
-Público-alvo dos anúncios: mães de crianças entre 4-10 anos.
+Fluxo padrão:
+1. Buscar ads via Meta Ads MCP (keywords: alfabetização, método fônico, leitura infantil)
+2. Buscar conteúdo orgânico via mine_organic_offers
+3. Para cada item: analisar hook, classificar score (0-10), identificar padrão
+4. Persistir no Supabase via MCP: INSERT na tabela ad_library (platform, url, copy, hook, score, viral_metrics)
+5. Hooks únicos e relevantes: INSERT em hooks_library (text, category, score)
 
-Ao finalizar, sempre emita o evento 'intel_available' com resumo do que foi encontrado.`;
+Schema ad_library: platform, url, copy, visual_description, hook, score, viral_metrics (jsonb), mined_at
+Schema hooks_library: text, category, score, tier (default 'testing')
+
+Nicho: alfabetização infantil. Público: mães de crianças 4-10 anos.
+Limite: 20 items por execução. Priorize maior engajamento.
+Ao finalizar, resuma quantos ads e hooks foram salvos.`;
 
 export class ScoutAgent extends BaseAgent {
   constructor() {
-    const tools: ToolHandler[] = [
-      organicMiningTool,
-      metaAdLibraryTool,
-      {
-        definition: {
-          name: 'save_ad_to_library',
-          description: 'Salva um anúncio mineralizado na biblioteca de ads do Supabase',
-          input_schema: {
-            type: 'object' as const,
-            properties: {
-              platform: { type: 'string', enum: ['meta', 'instagram', 'tiktok', 'youtube', 'organic'] },
-              url: { type: 'string' },
-              copy: { type: 'string' },
-              visual_description: { type: 'string' },
-              hook: { type: 'string' },
-              score: { type: 'number', minimum: 0, maximum: 10 },
-              viral_metrics: { type: 'object' },
-            },
-            required: ['platform'],
-          },
-        },
-        execute: async (input) => {
-          const { data, error } = await this.db.from('ad_library').insert(asInsert({
-            platform: input['platform'] as string,
-            url: (input['url'] as string | undefined) ?? null,
-            copy: (input['copy'] as string | undefined) ?? null,
-            visual_description: (input['visual_description'] as string | undefined) ?? null,
-            hook: (input['hook'] as string | undefined) ?? null,
-            score: (input['score'] as number | undefined) ?? null,
-            viral_metrics: (input['viral_metrics'] as Record<string, unknown>) ?? {},
-          })).select('id').single();
+    const customTools: ToolHandler[] = [organicMiningTool];
 
-          if (error) throw new Error(error.message);
-          const row = data as { id?: string } | null;
-          return { saved: true, id: row?.id };
-        },
-      },
-      {
-        definition: {
-          name: 'save_hook_to_library',
-          description: 'Salva um hook descoberto na biblioteca de hooks',
-          input_schema: {
-            type: 'object' as const,
-            properties: {
-              text: { type: 'string' },
-              category: { type: 'string' },
-              score: { type: 'number', minimum: 0, maximum: 10 },
-            },
-            required: ['text'],
-          },
-        },
-        execute: async (input) => {
-          const { data, error } = await this.db.from('hooks_library').insert(asInsert({
-            text: input['text'] as string,
-            category: (input['category'] as string | undefined) ?? null,
-            score: (input['score'] as number | undefined) ?? 5.0,
-          })).select('id').single();
-
-          if (error) throw new Error(error.message);
-          const row = data as { id?: string } | null;
-          return { saved: true, id: row?.id };
-        },
-      },
-    ];
-
-    super('scout', tools, SYSTEM_PROMPT, 'fast');
+    super('scout', customTools, SYSTEM_PROMPT, 'fast', getMcpServers('scout'));
   }
 
   async run(task: AgentTask): Promise<AgentResult> {
@@ -94,14 +38,9 @@ export class ScoutAgent extends BaseAgent {
       platform?: string;
     };
 
-    const userMessage = `Minere anúncios sobre "${keywords.join(', ')}" na plataforma ${platform}.
-Para cada anúncio encontrado:
-1. Analise o hook principal
-2. Classifique o score de viralidade (0-10)
-3. Salve na biblioteca usando save_ad_to_library
-4. Se o hook for relevante e único, salve também com save_hook_to_library
-
-Limite de 20 anúncios por execução. Priorize os com maior engajamento.`;
+    const userMessage = `Mine anúncios sobre "${keywords.join(', ')}" na plataforma ${platform}.
+Use o Meta Ads MCP para buscar anúncios e o Supabase MCP para persistir os resultados.
+Também mine conteúdo orgânico via mine_organic_offers.`;
 
     const result = await this.execute(task, userMessage);
 

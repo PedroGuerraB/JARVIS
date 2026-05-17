@@ -12,24 +12,38 @@ import {
 
 export type { ToolHandler };
 
+export interface McpServerConfig {
+  name: string;
+  url: string;
+  authToken?: string | undefined;
+}
+
+// MCP tool names are prefixed with server name (e.g. "supabase__execute_sql")
+function isMcpTool(toolName: string, mcpServers: McpServerConfig[]): boolean {
+  return mcpServers.some(s => toolName.startsWith(`${s.name}__`) || toolName.startsWith(`${s.name}_`));
+}
+
 export abstract class BaseAgent {
   protected readonly client: Anthropic;
   protected readonly db: JarvisSupabaseClient;
   protected readonly obsidian: ObsidianMemory;
   protected readonly memory: SupabaseMemory;
   protected readonly model: string;
+  protected readonly mcpServers: McpServerConfig[];
 
   constructor(
     readonly name: AgentName,
     protected readonly toolHandlers: ToolHandler[],
     protected readonly systemPrompt: string,
     model: keyof typeof MODELS = 'fast',
+    mcpServers: McpServerConfig[] = [],
   ) {
     this.client = new Anthropic();
     this.db = createClient();
     this.obsidian = new ObsidianMemory();
     this.memory = new SupabaseMemory(this.db);
     this.model = MODELS[model];
+    this.mcpServers = mcpServers;
   }
 
   abstract run(task: AgentTask): Promise<AgentResult>;
@@ -48,24 +62,44 @@ export abstract class BaseAgent {
       { role: 'user', content: userMessage },
     ];
 
+    // Build MCP servers config for Anthropic beta
+    const mcpServersParam = this.mcpServers.map(s => ({
+      type: 'url' as const,
+      name: s.name,
+      url: s.url,
+      ...(s.authToken ? { authorization_token: s.authToken } : {}),
+    }));
+
+    const hasMcp = mcpServersParam.length > 0;
+    const hasCustomTools = this.toolHandlers.length > 0;
+
     let iterations = 0;
 
     while (iterations < AGENT_MAX_ITERATIONS) {
       iterations++;
 
-      const response = await this.client.messages.create({
+      // Use beta endpoint when MCP servers are configured
+      const requestParams = {
         model: this.model,
         max_tokens: 8096,
         system,
-        tools: this.toolHandlers.map(h => h.definition),
         messages,
-      });
+        ...(hasCustomTools ? { tools: this.toolHandlers.map(h => h.definition) } : {}),
+      };
+
+      const response = hasMcp
+        ? await (this.client.beta.messages.create as Function)({
+            ...requestParams,
+            betas: ['mcp-client-2025-04-04'],
+            mcp_servers: mcpServersParam,
+          })
+        : await this.client.messages.create(requestParams as Anthropic.MessageCreateParamsNonStreaming);
 
       totalInputTokens += response.usage.input_tokens;
       totalOutputTokens += response.usage.output_tokens;
 
       if (response.stop_reason === 'end_turn') {
-        const textContent = response.content.find(b => b.type === 'text');
+        const textContent = response.content.find((b: { type: string }) => b.type === 'text') as { text: string } | undefined;
         const output = textContent ? { response: textContent.text } : {};
         await this.logExecution(task, true, totalInputTokens, totalOutputTokens, Date.now() - start);
         return {
@@ -81,8 +115,11 @@ export abstract class BaseAgent {
 
         const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
-        for (const block of response.content) {
-          if (block.type !== 'tool_use') continue;
+        for (const block of response.content as Array<{ type: string; id?: string; name?: string; input?: unknown }>) {
+          if (block.type !== 'tool_use' || !block.id || !block.name) continue;
+
+          // MCP tools are executed server-side by Anthropic — skip client handling
+          if (isMcpTool(block.name, this.mcpServers)) continue;
 
           const handler = this.toolHandlers.find(h => h.definition.name === block.name);
           if (!handler) {
@@ -92,18 +129,16 @@ export abstract class BaseAgent {
 
           try {
             const result = await handler.execute(block.input as Record<string, unknown>);
-            toolResults.push({
-              type: 'tool_result',
-              tool_use_id: block.id,
-              content: JSON.stringify(result),
-            });
+            toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: msg, is_error: true });
           }
         }
 
-        messages.push({ role: 'user', content: toolResults });
+        if (toolResults.length > 0) {
+          messages.push({ role: 'user', content: toolResults });
+        }
         continue;
       }
 
@@ -136,12 +171,7 @@ export abstract class BaseAgent {
     durationMs: number,
     error?: string,
   ): Promise<void> {
-    const { data: agentRow } = await this.db
-      .from('agents')
-      .select('id')
-      .eq('name', this.name)
-      .single();
-
+    const { data: agentRow } = await this.db.from('agents').select('id').eq('name', this.name).single();
     const agentId = (agentRow as { id?: string } | null)?.id ?? null;
 
     await this.db.from('agent_logs').insert(asInsert({
@@ -154,5 +184,13 @@ export abstract class BaseAgent {
       success,
       error: error ?? null,
     }));
+  }
+
+  protected async updateTaskStatus(taskId: string, status: string, error?: string): Promise<void> {
+    await this.db.from('agent_tasks').update(asUpdate({
+      status,
+      completed_at: ['done', 'failed'].includes(status) ? new Date().toISOString() : undefined,
+      ...(error ? { error } : {}),
+    })).eq('id', taskId);
   }
 }

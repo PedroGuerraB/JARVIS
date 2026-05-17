@@ -1,87 +1,32 @@
-import { asInsert } from '@jarvis/db';
-import type { AgentTask, AgentResult } from '@jarvis/shared';
-import { BaseAgent, type ToolHandler } from '../base/BaseAgent.js';
+import type { AgentTask, AgentResult, ToolHandler } from '@jarvis/shared';
+import { BaseAgent } from '../base/BaseAgent.js';
+import { getMcpServers } from '../mcp-config.js';
 import { headlineGenTool } from '@jarvis/tools';
 
 const SYSTEM_PROMPT = `Você é o Creative Agent do JARVIS.
 Sua missão: geração e scoring de criativos para o nicho de alfabetização.
 
-Responsabilidades:
-- Gerar variações de headlines e copies com base em hooks validados
-- Usar a memória de hooks vencedores para orientar a criação
-- Classificar criativos por potencial antes de salvar
-- Gerar estrutura completa: headline + copy + CTA
+Ferramentas disponíveis:
+- **supabase MCP**: Leia hooks_library para contexto, escreva em creatives.
+- **generate_headline_variations**: Tool custom para gerar variações de headline.
 
-Nicho: alfabetização infantil, mães de crianças 4-10 anos.
+Fluxo padrão:
+1. Ler top hooks via Supabase MCP: SELECT text, score FROM hooks_library WHERE tier='high-performance' ORDER BY score DESC LIMIT 10
+2. Usar generate_headline_variations com base nos hooks encontrados
+3. Para cada variante: avaliar score (0-10), criar copy completa (problema→agitação→solução→prova→CTA)
+4. Salvar via Supabase MCP os com score >= 6: INSERT em creatives (type, headline, copy, score, status='draft')
+
+Schema creatives: type (copy/image/video/carousel/reel), headline, copy, hook_id, score, status, ab_group
+
+Nicho: alfabetização infantil, mães 4-10 anos.
 Tom: urgência, esperança, transformação, prova social.
-
-Sempre gere mínimo 5 variações por tarefa. Salve apenas as com score >= 6.`;
+Mínimo 5 variações por tarefa. Salve apenas score >= 6.`;
 
 export class CreativeAgent extends BaseAgent {
   constructor() {
-    const tools: ToolHandler[] = [
-      headlineGenTool,
-      {
-        definition: {
-          name: 'get_top_hooks',
-          description: 'Busca os hooks com melhor score da biblioteca para usar como base',
-          input_schema: {
-            type: 'object' as const,
-            properties: {
-              limit: { type: 'number', default: 10 },
-              tier: { type: 'string', enum: ['high-performance', 'testing'] },
-            },
-          },
-        },
-        execute: async (input) => {
-          const { data } = await this.db
-            .from('hooks_library')
-            .select('id, text, category, score, conversion_rate')
-            .eq('tier', (input['tier'] as string) ?? 'high-performance')
-            .order('score', { ascending: false })
-            .limit((input['limit'] as number) ?? 10);
+    const customTools: ToolHandler[] = [headlineGenTool];
 
-          return data ?? [];
-        },
-      },
-      {
-        definition: {
-          name: 'save_creative',
-          description: 'Salva um criativo gerado no banco com score e status',
-          input_schema: {
-            type: 'object' as const,
-            properties: {
-              type: { type: 'string', enum: ['copy', 'image', 'video', 'carousel', 'reel'] },
-              headline: { type: 'string' },
-              copy: { type: 'string' },
-              hook_id: { type: 'string' },
-              score: { type: 'number', minimum: 0, maximum: 10 },
-              ab_group: { type: 'string' },
-            },
-            required: ['type', 'headline', 'score'],
-          },
-        },
-        execute: async (input) => {
-          const score = input['score'] as number;
-          if (score < 6) return { saved: false, reason: 'Score below threshold (6.0)' };
-
-          const { data, error } = await this.db.from('creatives').insert(asInsert({
-            type: input['type'] as string,
-            headline: (input['headline'] as string | undefined) ?? null,
-            copy: (input['copy'] as string | undefined) ?? null,
-            hook_id: (input['hook_id'] as string | undefined) ?? null,
-            score,
-            ab_group: (input['ab_group'] as string | undefined) ?? null,
-          })).select('id').single();
-
-          if (error) throw new Error(error.message);
-          const row = data as { id?: string } | null;
-          return { saved: true, id: row?.id, score };
-        },
-      },
-    ];
-
-    super('creative', tools, SYSTEM_PROMPT, 'powerful');
+    super('creative', customTools, SYSTEM_PROMPT, 'powerful', getMcpServers('creative'));
   }
 
   async run(task: AgentTask): Promise<AgentResult> {
@@ -91,14 +36,9 @@ export class CreativeAgent extends BaseAgent {
       use_top_hooks?: boolean;
     };
 
-    const userMessage = `${use_top_hooks ? 'Primeiro busque os top hooks com get_top_hooks. ' : ''}
+    const userMessage = `${use_top_hooks ? 'Primeiro leia os top hooks do Supabase MCP. ' : ''}
 Gere ${n_variants} variações de criativos ${base_copy ? `com base em: "${base_copy}"` : 'para o nicho de alfabetização'}.
-
-Para cada criativo:
-1. Crie headline (max 10 palavras, impacto imediato)
-2. Crie copy completa (problema → agitação → solução → prova → CTA)
-3. Classifique score de 0-10
-4. Salve com save_creative (apenas score >= 6)`;
+Salve os aprovados (score >= 6) via Supabase MCP.`;
 
     const result = await this.execute(task, userMessage);
 
