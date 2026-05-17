@@ -1,0 +1,21 @@
+{
+  "name": "@jarvis/memory",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@jarvis/db": "workspace:*",
+    "@jarvis/shared": "workspace:*",
+    "gray-matter": "^4.0.3",
+    "openai": "^4.104.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "typescript": "^5.8.3"
+  }
+}

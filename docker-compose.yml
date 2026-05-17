@@ -1,0 +1,26 @@
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: apps/orchestrator/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ${OBSIDIAN_VAULT_PATH}:/vault:rw
+    networks:
+      - jarvis
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    env_file: .env
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks:
+      - jarvis
+
+networks:
+  jarvis:
+    driver: bridge
